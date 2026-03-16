@@ -1,0 +1,3 @@
+# HyperGraphMem Agent Loop Configuration
+- name: hypergraphmem_tool_agent
+  _target_: hypergraphmem_agent.agent.hypergraphmem_agent_loop.HyperGraphMemToolAgentLoop
