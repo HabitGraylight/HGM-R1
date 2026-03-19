@@ -9,14 +9,19 @@ import inspect
 import logging
 import os
 import re
+import sys
 import string
-from pathlib import Path
 from collections import Counter
+from pathlib import Path
 from typing import Any, Dict
 
 import numpy as np
 from omegaconf import DictConfig
 from transformers import AutoTokenizer
+
+REPO_ROOT = Path(__file__).resolve().parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from verl import DataProto
 from verl.experimental.reward_loop.reward_manager import register
@@ -24,7 +29,7 @@ from verl.experimental.reward_loop.reward_manager.base import RewardManagerBase
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_HGM_CONFIG_PATH = Path(__file__).resolve().with_name("hypergraphmem_config.yaml")
+DEFAULT_HGM_CONFIG_PATH = REPO_ROOT / "hypergraphmem_config.yaml"
 
 
 def normalize_answer(answer_text: Any) -> str:

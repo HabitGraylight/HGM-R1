@@ -19,6 +19,7 @@ conda activate hgm_verl
 
 ```bash
 cd /root/HGM_mew/HGM
+export PYTHONPATH="$(pwd)${PYTHONPATH:+:$PYTHONPATH}"
 python minimal_hgm/pipeline_minilm.py --device auto
 ```
 
@@ -49,6 +50,8 @@ env -u https_proxy -u HTTPS_PROXY -u http_proxy -u HTTP_PROXY -u ALL_PROXY \
 Run RL training on one dialogue (index 0):
 
 ```bash
+cd /root/HGM_mew/HGM
+export PYTHONPATH="$(pwd)${PYTHONPATH:+:$PYTHONPATH}"
 python minimal_hgm/verl_locomo_one_dialog_rl.py \
   --locomo-path data/locomo10.json \
   --dialogue-index 0 \

@@ -33,11 +33,20 @@ async def rerank_texts(
         logger.warning("Reranker base_url missing.")
         return [(i, t, 0.0) for i, t in enumerate(texts)][:top_k]
 
-    payload = {
-        "model": model_name,
-        "text_1": query,
-        "text_2": texts
-    }
+    # Support both legacy reranker payload (text_1/text_2) and wrapper payload (query/documents).
+    if str(base_url).rstrip("/").endswith("/v1/rerank"):
+        payload = {
+            "model": model_name,
+            "query": query,
+            "documents": texts,
+            "top_k": top_k or len(texts),
+        }
+    else:
+        payload = {
+            "model": model_name,
+            "text_1": query,
+            "text_2": texts,
+        }
     headers = {"Content-Type": "application/json"}
     if api_key != "empty":
         headers["Authorization"] = f"Bearer {api_key}"

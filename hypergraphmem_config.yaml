@@ -1,58 +1,44 @@
-# hypergraphmem_config.yaml
-
-# 基础路径 (会被环境变量 HYPERGRAPHMEM_MEMORY_DIR 覆盖，这里只是备用)
-working_dir: "./output/memory_cache"
-
-# 记忆生命周期
+working_dir: ./output/memory_cache
 short_term_retention_seconds: 86400
 short_to_long_term_threshold: 5
-
-# 操作参数
 operation:
   chunk_token_size: 1200
   chunk_overlap_token_size: 100
   max_participants_expand: 64
   top_m_hyperedges: 5
   top_n_chunks: 3
-
-# LLM 服务配置 (用于提取、总结等)
 llm:
-  base_url: "http://10.26.1.186:8003/v1"
-  api_key: "empty"
-  model_name: "Qwen/Qwen3-8B-AWQ"
+  base_url: http://10.26.1.21:8003/v1
+  api_key: EMPTY
+  model_name: Qwen3-8B
   concurrent_limit: 8
-  max_token: 8192
-
-# Embedding 服务配置
+  max_token: 512
 embedding:
-  base_url: "http://10.26.1.184:8811/v1/embeddings"
-  api_key: "empty"
-  model_name: "Qwen3-Embedding-0.6B"
+  base_url: http://10.26.1.21:8004/v1/embeddings
+  api_key: EMPTY
+  model_name: Qwen3-Embedding-0.6B
   embedding_dim: 1024
-
-# Reranker 服务配置
 reranker:
-  base_url: "http://localhost:8080/engines/vllm/rerank"
-  model_name: "ai/qwen3-reranker-vllm:4B"
-  api_key: "empty"
-
-# 存储后端
+  base_url: http://10.26.1.184:8007/v1/rerank
+  model_name: Qwen3-Reranker-0.6B
+  api_key: EMPTY
 storage:
-  vector_backend_preference: "nano"
-
-# 检索参数
+  vector_backend_preference: nano
 query:
   cos_top_k_entity: 3
   cos_top_k_hyperedge: 5
   rerank_top_k_hyperedge: 5
   rerank_top_k_chunk: 5
-
-# 奖励模型参数
+  graph_expand_max_candidates: 0
+  graph_degree_penalty: 0.0
+  max_chunk_candidates: 64
+  source_chunk_neighbors_per_hyperedge: 3
+  chunk_vdb_top_k: 0
 reward_kwargs:
   enable: true
   metric_weight: 0.4
   judge_weight: 0.6
-  metric_type: "f1"
-  eval_model: "gpt-4o"
-  eval_base_url: "http://10.26.1.186:8003/v1"
-  eval_api_key: "empty"
+  metric_type: f1
+  eval_model: gpt-4o
+  eval_base_url: http://10.26.1.186:8003/v1
+  eval_api_key: empty

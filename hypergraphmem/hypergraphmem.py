@@ -3,6 +3,7 @@ import asyncio
 import os
 import shutil
 import logging
+import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional, Dict, Any, List
@@ -28,6 +29,7 @@ from hypergraphmem.storage import (
 
 # [CRITICAL]: 导入无状态 embedding 函数
 from hypergraphmem.embedding import get_embeddings
+from hypergraphmem.llm import close_global_session
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +48,8 @@ class LayeredMemoryManager:
     text_chunks_kv: Optional[JsonKVStorage] = None
     kg: Optional[NetworkXStorage] = None
     chunk_vdb: Optional[BaseVectorStorage] = None
+    _last_memory_id: Optional[str] = None
+    _last_memory_session_id: Optional[str] = None
     
     def __post_init__(self):
         # 1. 配置防御性拷贝
@@ -143,6 +147,128 @@ class LayeredMemoryManager:
 
     # ----------------- Write Operations -----------------
 
+    @staticmethod
+    def _extract_dia_session_id(content: str) -> Optional[int]:
+        m = re.search(r"\[(?:D(\d+):\d+)\]", content or "")
+        if not m:
+            return None
+        try:
+            d_main = int(m.group(1))
+        except Exception:
+            return None
+        return ((d_main - 1) // 3) + 1
+
+    @staticmethod
+    def _extract_time_bucket(happened_at: Optional[str]) -> Optional[str]:
+        ts = (happened_at or "").strip()
+        if not ts:
+            return None
+
+        # Fast path for common LoCoMo/HGM timestamps: YYYY-MM-DD or YYYY-MM-DD HH:MM
+        m = re.search(r"(\d{4}-\d{2}-\d{2})", ts)
+        if m:
+            return m.group(1)
+
+        try:
+            dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            return dt.date().isoformat()
+        except Exception:
+            return None
+
+    def _resolve_temporal_bucket(self, content: str, happened_at: Optional[str]) -> Optional[str]:
+        dia_session = self._extract_dia_session_id(content)
+        if dia_session is not None:
+            return f"S{dia_session}"
+
+        day_bucket = self._extract_time_bucket(happened_at)
+        if day_bucket:
+            return f"D{day_bucket}"
+        return None
+
+    def _graph_cfg(self) -> Dict[str, Any]:
+        g = self.config.get("graph", {})
+        return g if isinstance(g, dict) else {}
+
+    async def _maybe_link_temporal_edge(
+        self,
+        current_mem_id: Optional[str],
+        content: str,
+        happened_at: Optional[str] = None,
+    ) -> None:
+        if not current_mem_id:
+            return
+
+        gcfg = self._graph_cfg()
+        tcfg = gcfg.get("temporal_link", {}) if isinstance(gcfg.get("temporal_link", {}), dict) else {}
+        enabled = bool(tcfg.get("enabled", True))
+
+        curr_bucket = self._resolve_temporal_bucket(content, happened_at)
+
+        if not enabled:
+            self._last_memory_id = current_mem_id
+            self._last_memory_session_id = curr_bucket
+            return
+
+        link_across_sessions = bool(tcfg.get("link_across_sessions", False))
+        should_link = self._last_memory_id is not None
+
+        if should_link and not link_across_sessions:
+            # Strict temporal guard: if bucket is unknown on either side, do not force-link.
+            if self._last_memory_session_id is None or curr_bucket is None:
+                should_link = False
+            else:
+                should_link = str(self._last_memory_session_id) == str(curr_bucket)
+
+        if should_link:
+            try:
+                await self.kg.upsert_edge(
+                    self._last_memory_id,
+                    current_mem_id,
+                    {
+                        "relation": "temporal_next",
+                        "created_at": datetime.utcnow().isoformat(),
+                    },
+                )
+            except Exception as e:
+                logger.warning(f"[Graph] Failed temporal link {self._last_memory_id}->{current_mem_id}: {e}")
+
+        self._last_memory_id = current_mem_id
+        self._last_memory_session_id = curr_bucket
+
+    async def _maybe_link_memory_chunk(self, current_mem_id: Optional[str], source_chunk_id: Optional[str]) -> None:
+        if not current_mem_id or not source_chunk_id:
+            return
+
+        gcfg = self._graph_cfg()
+        enabled = bool(gcfg.get("link_memory_to_chunk", True))
+        if not enabled:
+            return
+
+        try:
+            chunk = None
+            chunks = await self.text_chunks_kv.get_by_ids([source_chunk_id])
+            if chunks and chunks[0]:
+                chunk = chunks[0]
+            chunk_content = chunk.get("content", "") if chunk else ""
+            await self.kg.upsert_node(
+                source_chunk_id,
+                {
+                    "content": chunk_content,
+                    "node_type": "chunk",
+                    "source_id": source_chunk_id,
+                },
+            )
+            await self.kg.upsert_edge(
+                current_mem_id,
+                source_chunk_id,
+                {
+                    "relation": "source_chunk",
+                    "created_at": datetime.utcnow().isoformat(),
+                },
+            )
+        except Exception as e:
+            logger.warning(f"[Graph] Failed memory-chunk link for {current_mem_id}: {e}")
+
     async def ingest_source_chunk(self, text: str, timestamp: str = None) -> str:
         """Store raw chunk."""
         if not text or not text.strip(): return None
@@ -178,16 +304,22 @@ class LayeredMemoryManager:
         # [LOGGING] 开始提取
         logger.info(f"[🧠 Add Fact] Processing: '{content[:40]}...' (Type: {memory_type})")
         
-        try:
-            entities = await ner_from_text(content, self.config)
-            # [LOGGING] 实体提取结果
-            if entities:
-                logger.info(f"   -> Found Entities: {entities}")
-            else:
-                logger.info(f"   -> No specific entities found.")
-        except Exception as e:
-            logger.warning(f"   -> NER failed: {e}")
+        gcfg = self._graph_cfg()
+        use_entity_links = bool(gcfg.get("use_entity_links", True))
+
+        if use_entity_links:
+            try:
+                entities = await ner_from_text(content, self.config)
+                if entities:
+                    logger.info(f"   -> Found Entities: {entities}")
+                else:
+                    logger.info("   -> No specific entities found.")
+            except Exception as e:
+                logger.warning(f"   -> NER failed: {e}")
+                entities = []
+        else:
             entities = []
+            logger.info("   -> Entity linking disabled by graph.use_entity_links=false")
 
         mu_dict = {
             "hyperedge_content": content,
@@ -198,13 +330,17 @@ class LayeredMemoryManager:
             "happened_at": timestamp,
         }
 
-        await add_memory_unit(
-            mu_dict, 
-            self.kg, 
-            self.entity_vdb, 
-            self.hyperedge_vdb, 
-            self.text_chunks_kv
+        mem_id = await add_memory_unit(
+            mu_dict,
+            self.kg,
+            self.entity_vdb,
+            self.hyperedge_vdb,
+            self.text_chunks_kv,
         )
+
+        await self._maybe_link_temporal_edge(mem_id, content, timestamp)
+        await self._maybe_link_memory_chunk(mem_id, source_chunk_id)
+
         # [LOGGING] 关键：操作后的图统计
         self._try_log_graph_stats("Add Fact")
 
@@ -254,18 +390,89 @@ class LayeredMemoryManager:
 
     async def retrieve_context_dict(self, query: str) -> Dict[str, Any]:
         logger.info(f"[🔍 Retrieve] Query: '{query[:50]}...'")
-        
+
         hyperedges = await retrieve_hyperedge(
             query, self.kg, self.entity_vdb, self.hyperedge_vdb, None, self.config
         )
-        hyperedge_ids = {h["id"] for h in hyperedges}
-        
+
+        qcfg = self.config.get("query", {}) if isinstance(self.config.get("query", {}), dict) else {}
+        max_chunk_candidates = int(qcfg.get("max_chunk_candidates", 64))
+        source_chunk_neighbors_per_hyperedge = int(qcfg.get("source_chunk_neighbors_per_hyperedge", 3))
+        chunk_vdb_top_k = int(qcfg.get("chunk_vdb_top_k", 0))
+
+        chunk_scores: Dict[str, float] = {}
+
+        def _add_chunk_candidate(chunk_id: str, score: float) -> None:
+            if not isinstance(chunk_id, str) or not chunk_id.startswith("chunk-"):
+                return
+            chunk_scores[chunk_id] = chunk_scores.get(chunk_id, 0.0) + float(score)
+
+        # 1) Direct source chunk ids on retrieved memories.
+        for h in hyperedges:
+            _add_chunk_candidate(h.get("source_id"), 3.0)
+
+        # 2) Expand source_chunk neighbors from retrieved memory nodes.
+        if source_chunk_neighbors_per_hyperedge > 0:
+            mem_ids = [
+                h.get("id")
+                for h in hyperedges
+                if isinstance(h.get("id"), str) and h.get("id", "").startswith("mem-")
+            ]
+            if mem_ids:
+                edge_lists = await asyncio.gather(*[self.kg.get_node_edges(mid) for mid in mem_ids], return_exceptions=True)
+                for edges in edge_lists:
+                    if isinstance(edges, Exception) or not isinstance(edges, list):
+                        continue
+                    local: List[tuple[str, float]] = []
+                    for s, t, d in edges:
+                        s_id = s if isinstance(s, str) else ""
+                        t_id = t if isinstance(t, str) else ""
+                        if s_id.startswith("chunk-"):
+                            other = s_id
+                        elif t_id.startswith("chunk-"):
+                            other = t_id
+                        else:
+                            continue
+                        rel = d.get("relation", "") if isinstance(d, dict) else ""
+                        w = 2.0 if rel == "source_chunk" else 1.0
+                        local.append((other, w))
+
+                    local.sort(key=lambda x: (-x[1], x[0]))
+                    if source_chunk_neighbors_per_hyperedge > 0:
+                        local = local[:source_chunk_neighbors_per_hyperedge]
+                    for cid, w in local:
+                        _add_chunk_candidate(cid, w)
+
+        # 3) Optional semantic chunk expansion from chunk vector DB.
+        if chunk_vdb_top_k > 0 and self.chunk_vdb is not None:
+            try:
+                extra_chunks = await self.chunk_vdb.query(query, top_k=chunk_vdb_top_k)
+                for item in extra_chunks or []:
+                    cid = item.get("id") if isinstance(item, dict) else None
+                    dist = item.get("distance", 1.0) if isinstance(item, dict) else 1.0
+                    try:
+                        sim = 1.0 - float(dist)
+                    except Exception:
+                        sim = 0.0
+                    _add_chunk_candidate(cid, max(0.25, sim))
+            except Exception as e:
+                logger.warning(f"[Retrieve] chunk_vdb expansion failed: {e}")
+
+        ranked_chunk_ids = sorted(chunk_scores.items(), key=lambda kv: (-kv[1], kv[0]))
+        if max_chunk_candidates > 0:
+            ranked_chunk_ids = ranked_chunk_ids[:max_chunk_candidates]
+        chunk_ids = {cid for cid, _ in ranked_chunk_ids}
+
         chunks = await retrieve_chunk(
-            query, hyperedge_ids, self.config, self.text_chunks_kv, None
+            query, chunk_ids, self.config, self.text_chunks_kv, None
         )
-        
-        logger.info(f"   -> Result: {len(hyperedges)} Hyperedges, {len(chunks)} Source Chunks.")
+
+        logger.info(
+            f"   -> Result: {len(hyperedges)} Hyperedges, {len(chunks)} Source Chunks "
+            f"(chunk_candidates={len(chunk_ids)})."
+        )
         return {"hyperedges": hyperedges, "sources": chunks}
+
 
     async def retrieve_hyperedges_list(self, query: str) -> List[Dict]:
         res = await retrieve_hyperedge(
@@ -294,6 +501,10 @@ class LayeredMemoryManager:
         
         if tasks:
             await asyncio.gather(*tasks)
+        try:
+            await close_global_session()
+        except Exception as e:
+            logger.debug(f"[Close] ignore llm session close error: {e}")
         logger.info(f"[🛑 Closing] All indexes saved.")
 
     async def destroy(self):

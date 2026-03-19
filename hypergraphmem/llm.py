@@ -58,6 +58,12 @@ async def llm_chat_request(
     api_key = llm_cfg.get("api_key")
     model_name = llm_cfg.get("model_name")
 
+    global MAX_CONCURRENT_REQUESTS, _SEMAPHORE
+    cfg_limit = int(llm_cfg.get("concurrent_limit", MAX_CONCURRENT_REQUESTS))
+    if cfg_limit > 0 and cfg_limit != MAX_CONCURRENT_REQUESTS:
+        MAX_CONCURRENT_REQUESTS = cfg_limit
+        _SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+
     # Retry & Timeout Configuration
     max_retries = int(llm_cfg.get("max_retries", 5))
     base_delay = float(llm_cfg.get("retry_delay", 2.0))
@@ -68,9 +74,11 @@ async def llm_chat_request(
         raise ValueError("LLM base_url is not configured.")
 
     # Determine generation parameters
-    defaults = {"temperature": 0.0, "top_p": 1.0, "max_tokens": 2048}
-    gen_max = int(llm_cfg.get("max_token", 2048))
-    defaults["max_tokens"] = gen_max
+    defaults = {
+        "temperature": float(llm_cfg.get("temperature", 0.0)),
+        "top_p": float(llm_cfg.get("top_p", 1.0)),
+        "max_tokens": int(llm_cfg.get("max_token", 2048)),
+    }
     
     # Merge parameters
     payload_params = {**defaults, **kwargs}

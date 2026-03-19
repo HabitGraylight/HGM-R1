@@ -5,11 +5,16 @@ import copy
 import json
 import logging
 import os
+import sys
 from pathlib import Path
 from enum import Enum
 from typing import Any, List, Dict
 from dataclasses import dataclass, field
 from uuid import uuid4
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from hypergraphmem.hypergraphmem import LayeredMemoryManager
 from hypergraphmem_agent.agent.hypergraphmem_executor import HyperGraphMemExecutor
@@ -27,7 +32,6 @@ from datetime import datetime
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_HGM_CONFIG_PATH = REPO_ROOT / "hypergraphmem_config.yaml"
 
 @dataclass

@@ -30,6 +30,121 @@ def _get_query_setting(global_config: dict, key: str, default: Any) -> Any:
 
     return default
 
+
+def _month_to_num(name: str) -> Optional[int]:
+    token = (name or "").strip().lower()
+    months = {
+        "jan": 1,
+        "january": 1,
+        "feb": 2,
+        "february": 2,
+        "mar": 3,
+        "march": 3,
+        "apr": 4,
+        "april": 4,
+        "may": 5,
+        "jun": 6,
+        "june": 6,
+        "jul": 7,
+        "july": 7,
+        "aug": 8,
+        "august": 8,
+        "sep": 9,
+        "sept": 9,
+        "september": 9,
+        "oct": 10,
+        "october": 10,
+        "nov": 11,
+        "november": 11,
+        "dec": 12,
+        "december": 12,
+    }
+    return months.get(token)
+
+
+def _build_datetime(y: int, mo: int, d: int, hh: int = 0, mm: int = 0, ss: int = 0) -> Optional[datetime]:
+    try:
+        return datetime(y, mo, d, hh, mm, ss)
+    except Exception:
+        return None
+
+
+def _extract_date_from_text(text: str) -> Optional[datetime]:
+    s = (text or "").strip()
+    if not s:
+        return None
+
+    # YYYY-MM-DD / YYYY-MM-DD HH:MM / YYYY-MM-DDTHH:MM:SS
+    m = re.search(r"(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{2}):(\d{2})(?::(\d{2}))?)?", s)
+    if m:
+        y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        hh = int(m.group(4) or 0)
+        mm = int(m.group(5) or 0)
+        ss = int(m.group(6) or 0)
+        return _build_datetime(y, mo, d, hh, mm, ss)
+
+    # Month DD, YYYY (e.g., March 26, 2023)
+    m = re.search(r"\b([A-Za-z]{3,9})\s+(\d{1,2}),?\s+(\d{4})\b", s)
+    if m:
+        mo = _month_to_num(m.group(1))
+        d = int(m.group(2))
+        y = int(m.group(3))
+        if mo is not None:
+            return _build_datetime(y, mo, d)
+
+    # DD Month YYYY (e.g., 26 March 2023)
+    m = re.search(r"\b(\d{1,2})\s+([A-Za-z]{3,9})\s*,?\s*(\d{4})\b", s)
+    if m:
+        d = int(m.group(1))
+        mo = _month_to_num(m.group(2))
+        y = int(m.group(3))
+        if mo is not None:
+            return _build_datetime(y, mo, d)
+
+    # MM/DD/YYYY
+    m = re.search(r"\b(\d{1,2})/(\d{1,2})/(\d{4})\b", s)
+    if m:
+        mo, d, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        return _build_datetime(y, mo, d)
+
+    return None
+
+
+def _parse_happened_at(ts: Any) -> Optional[datetime]:
+    s = ("" if ts is None else str(ts)).strip()
+    if not s:
+        return None
+
+    dt = _extract_date_from_text(s)
+    if dt is not None:
+        return dt
+
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def _memory_event_time(mem: dict) -> Optional[datetime]:
+    dt = _parse_happened_at(mem.get("happened_at"))
+    if dt is not None:
+        return dt
+    return _extract_date_from_text(str(mem.get("content", "")))
+
+
+def _temporal_query_mode(query: str) -> Optional[str]:
+    q = (query or "").lower()
+
+    if any(k in q for k in ["first", "earliest", "start", "started", "begin", "initial"]):
+        return "earliest"
+    if any(k in q for k in ["latest", "last", "most recent", "recently", "recent"]):
+        return "latest"
+    if re.search(r"\b(when|date|day|month|year|time)\b", q):
+        return "time"
+
+    return None
+
+
 # =============================================================================
 #  Formatter & Helper Functions
 # =============================================================================
@@ -179,6 +294,73 @@ async def extract_memories_from_text(
     logger.info(f"[Extract] Done chunk {chunk_key}. Found {len(knowledge_units)} facts.")
     return knowledge_units
 
+
+def _looks_like_time_entity(entity: str) -> bool:
+    e = (entity or "").lower().strip()
+    return bool(
+        re.search(r"\b(am|pm)\b", e)
+        or re.search(r"\b\d{1,2}:\d{2}\b", e)
+        or re.search(r"\b\d{1,2}\s+[a-z]+,\s*\d{4}\b", e)
+    )
+
+
+def _extract_speaker_name(text: str) -> str:
+    m = re.search(r"\]\s*([^:\n]{1,40}):", text or "")
+    return (m.group(1).strip().lower() if m else "")
+
+
+def _filter_entities(entities: list[str], text: str, global_config: dict) -> list[str]:
+    cfg = (global_config or {}).get("entity_filter", {})
+    if not isinstance(cfg, dict):
+        cfg = {}
+
+    enabled = bool(cfg.get("enabled", False))
+    if not enabled:
+        # keep stable behavior by default
+        out = []
+        seen = set()
+        for e in entities:
+            if not e:
+                continue
+            n = e.strip().lower()
+            if n and n not in seen:
+                seen.add(n)
+                out.append(n)
+        return out
+
+    drop_time_entities = bool(cfg.get("drop_time_entities", True))
+    drop_speaker_name = bool(cfg.get("drop_speaker_name", True))
+    min_entity_len = int(cfg.get("min_entity_len", 2))
+
+    drop_stop_entities = cfg.get("drop_stop_entities", ["calvin", "dave"])
+    if not isinstance(drop_stop_entities, list):
+        drop_stop_entities = ["calvin", "dave"]
+    stop_set = {str(x).strip().lower() for x in drop_stop_entities if str(x).strip()}
+
+    speaker_name = _extract_speaker_name(text) if drop_speaker_name else ""
+
+    out = []
+    seen = set()
+    for ent in entities:
+        n = (ent or "").strip().lower()
+        if not n:
+            continue
+        if len(n) < min_entity_len:
+            continue
+        if n in stop_set:
+            continue
+        if speaker_name and n == speaker_name:
+            continue
+        if drop_time_entities and _looks_like_time_entity(n):
+            continue
+        if n in seen:
+            continue
+        seen.add(n)
+        out.append(n)
+
+    return out
+
+
 async def ner_from_text(text: str, global_config: dict) -> list[str]:
     """
     Uses stateless llm_chat_request to extract entities.
@@ -199,13 +381,16 @@ async def ner_from_text(text: str, global_config: dict) -> list[str]:
         if isinstance(data, dict) and "named_entities" in data:
             for ent in data["named_entities"]:
                 norm = normalize_entity(ent)
-                if norm: entities.append(norm)
-        
+                if norm:
+                    entities.append(norm)
+
+        filtered = _filter_entities(entities, text, global_config)
+
         # [LOG]
-        if len(entities) > 0:
-            logger.info(f"[NER] Extracted {len(entities)} entities from text (len={len(text)}).")
-        
-        return entities
+        if len(filtered) > 0:
+            logger.info(f"[NER] Extracted {len(filtered)} entities from text (raw={len(entities)}, len={len(text)}).")
+
+        return filtered
     except Exception as e:
         logger.warning(f"[NER] Failed: {e}")
         return []
@@ -213,6 +398,17 @@ async def ner_from_text(text: str, global_config: dict) -> list[str]:
 # =============================================================================
 #  Storage Atomic Operations
 # =============================================================================
+
+def _extract_dia_meta_from_content(content: str) -> tuple[Optional[str], Optional[int], Optional[int]]:
+    m = re.search(r"\[(D(\d+):(\d+))\]", content or "")
+    if not m:
+        return None, None, None
+    dia_id = m.group(1)
+    d_main = int(m.group(2))
+    d_turn = int(m.group(3))
+    session_id = ((d_main - 1) // 3) + 1
+    return dia_id, session_id, d_turn
+
 
 async def add_memory_unit(
     memory_unit: dict,
@@ -228,7 +424,8 @@ async def add_memory_unit(
     happened_at = memory_unit.get("happened_at")
     now_ts = datetime.now(timezone.utc).isoformat()
     hyperedge_id = compute_mdhash_id(hyperedge_name, prefix="mem-")
-    
+    dia_id, dia_session_id, dia_turn_id = _extract_dia_meta_from_content(hyperedge_name)
+
     hyperedge_attrs = {
         "content": hyperedge_name,
         "source_id": source_id,
@@ -237,7 +434,10 @@ async def add_memory_unit(
         "call_count": 0,
         "created_at": created_at,
         "last_called": now_ts,
-        "happened_at": happened_at
+        "happened_at": happened_at,
+        "dia_id": dia_id,
+        "dia_session_id": dia_session_id,
+        "dia_turn_id": dia_turn_id,
     }
 
     # [1] 顺序执行：先写图
@@ -275,6 +475,8 @@ async def add_memory_unit(
             logger.info(f"[GraphStats] Nodes: {num_nodes}. Added Mem: {hyperedge_name[:30]}...")
     except Exception:
         pass
+
+    return hyperedge_id
 
 # --- Delete / Update Operations ---
 
@@ -418,13 +620,23 @@ async def retrieve_hyperedge(
         except Exception: pass
 
     # 2. NER & Search
-    query_entities = await ner_from_text(query, global_config)
-    
+    graph_cfg = global_config.get("graph", {}) if isinstance(global_config.get("graph", {}), dict) else {}
+    use_entity_links = bool(graph_cfg.get("use_entity_links", True))
+
+    if use_entity_links:
+        query_entities = await ner_from_text(query, global_config)
+    else:
+        query_entities = []
+
     entity_top_k = int(_get_query_setting(global_config, "cos_top_k_entity", 3))
     hyperedge_top_k = int(_get_query_setting(global_config, "cos_top_k_hyperedge", 5))
-    entity_tasks = [entity_vdb.query(e, top_k=entity_top_k) for e in query_entities]
+
+    entity_tasks = []
+    if use_entity_links and entity_top_k > 0 and query_entities:
+        entity_tasks = [entity_vdb.query(e, top_k=entity_top_k) for e in query_entities]
+
     he_task = hyperedge_vdb.query(query, top_k=hyperedge_top_k, query_embedding=query_embedding)
-    
+
     results = await asyncio.gather(*entity_tasks, he_task, return_exceptions=True)
     
     candidates = []
@@ -446,24 +658,78 @@ async def retrieve_hyperedge(
     
     hop1_task = _graph_hop(knowledge_graph, [e["id"] for e in ents], "mem-")
     hop2_task = _graph_hop_two_step(knowledge_graph, [m["id"] for m in mems], "ent-", "mem-")
-    
-    hop_results = await asyncio.gather(hop1_task, hop2_task)
-    candidate_ids = hop_results[0] | hop_results[1] | {m["id"] for m in mems}
+
+    use_temporal_edges = bool(_get_query_setting(global_config, "use_temporal_edges", True))
+    temporal_neighbors_per_seed = int(_get_query_setting(global_config, "temporal_neighbors_per_seed", 2))
+    graph_expand_max_candidates = int(_get_query_setting(global_config, "graph_expand_max_candidates", 0))
+    graph_degree_penalty = float(_get_query_setting(global_config, "graph_degree_penalty", 0.0))
+
+    hop_tasks = [hop1_task, hop2_task]
+    if use_temporal_edges:
+        hop_tasks.append(
+            _graph_temporal_hop(
+                knowledge_graph,
+                [m["id"] for m in mems],
+                max_neighbors_per_seed=temporal_neighbors_per_seed,
+            )
+        )
+
+    hop_results = await asyncio.gather(*hop_tasks)
+    hop1_ids = hop_results[0] if len(hop_results) > 0 else set()
+    hop2_ids = hop_results[1] if len(hop_results) > 1 else set()
+    temporal_ids = hop_results[2] if (use_temporal_edges and len(hop_results) > 2) else set()
+
+    direct_mem_ids = {m["id"] for m in mems}
+    candidate_ids = hop1_ids | hop2_ids | temporal_ids | direct_mem_ids
+    candidate_order = sorted(candidate_ids)
+
+    if graph_expand_max_candidates > 0 and len(candidate_ids) > graph_expand_max_candidates:
+        priority: Dict[str, float] = {}
+        for mid in direct_mem_ids:
+            priority[mid] = priority.get(mid, 0.0) + 3.0
+        for mid in hop1_ids:
+            priority[mid] = priority.get(mid, 0.0) + 2.0
+        for mid in hop2_ids:
+            priority[mid] = priority.get(mid, 0.0) + 1.0
+        for mid in temporal_ids:
+            priority[mid] = priority.get(mid, 0.0) + 0.75
+        for mid in candidate_ids:
+            priority.setdefault(mid, 0.0)
+
+        if graph_degree_penalty > 0 and candidate_ids:
+            mids_for_degree = list(candidate_ids)
+            edge_lists = await asyncio.gather(
+                *[knowledge_graph.get_node_edges(mid) for mid in mids_for_degree],
+                return_exceptions=True,
+            )
+            for mid, edges in zip(mids_for_degree, edge_lists):
+                deg = len(edges) if isinstance(edges, list) else 0
+                priority[mid] = priority.get(mid, 0.0) - graph_degree_penalty * min(deg, 50)
+
+        ranked = sorted(priority.items(), key=lambda kv: (-kv[1], kv[0]))
+        candidate_order = [mid for mid, _ in ranked[:graph_expand_max_candidates]]
+        candidate_ids = set(candidate_order)
 
     # [LOG]
-    logger.info(f"[Retrieve] Step 2 (Graph Expansion) result: {len(candidate_ids)} candidates.")
+    logger.info(
+        f"[Retrieve] Step 2 (Graph Expansion) result: {len(candidate_ids)} candidates "
+        f"(temporal={len(temporal_ids)})."
+    )
 
     # 4. Fetch & Rerank (Stateless)
     final_mems = []
     if candidate_ids:
-        nodes = await asyncio.gather(*[knowledge_graph.get_node(nid) for nid in candidate_ids])
-        
+        nodes = await asyncio.gather(*[knowledge_graph.get_node(nid) for nid in candidate_order])
+
         texts, meta_list = [], []
-        for nid, node in zip(candidate_ids, nodes):
+        for nid, node in zip(candidate_order, nodes):
             if node and node.get("content"):
                 meta_list.append({
                     "id": nid,
                     "content": node.get("content", ""),
+                    "source_id": node.get("source_id", ""),
+                    "dia_id": node.get("dia_id", ""),
+                    "dia_session_id": node.get("dia_session_id", None),
                     "call_count": node.get("call_count", 0),
                     "memory_type": node.get("memory_type", ""),
                     "created_at": node.get("created_at", ""),
@@ -475,14 +741,37 @@ async def retrieve_hyperedge(
         if texts:
             # [FIX]: 使用无状态函数调用进行 Rerank
             ranked = await rerank_texts(
-                query=query, 
-                texts=texts, 
-                config=global_config, 
-                top_k=int(_get_query_setting(global_config, "rerank_top_k_hyperedge", 5))
+                query=query,
+                texts=texts,
+                config=global_config,
+                top_k=int(_get_query_setting(global_config, "rerank_top_k_hyperedge", 5)),
             )
             # ranked return: List[Tuple[int, str, float]]
             final_mems = [meta_list[idx] for idx, _, _ in ranked]
-            
+
+            # Temporal post-ordering for when/first/latest questions.
+            t_mode = _temporal_query_mode(query)
+            if t_mode and final_mems:
+                with_ts: List[tuple[datetime, dict]] = []
+                without_ts: List[dict] = []
+                for mem in final_mems:
+                    dt = _memory_event_time(mem)
+                    if dt is None:
+                        without_ts.append(mem)
+                    else:
+                        with_ts.append((dt, mem))
+
+                if with_ts:
+                    if t_mode == "earliest":
+                        with_ts.sort(key=lambda x: x[0])
+                    elif t_mode == "latest":
+                        with_ts.sort(key=lambda x: x[0], reverse=True)
+                    else:
+                        # Generic "when" query: keep rerank order, only prioritize timestamped entries.
+                        pass
+
+                    final_mems = [m for _, m in with_ts] + without_ts
+
             # Update access stats
             await increment_memory_usage([m["id"] for m in final_mems], knowledge_graph)
 
@@ -516,6 +805,33 @@ async def retrieve_chunk(
     
     logger.info(f"[Retrieve] Chunks: {len(valid_chunks)} -> Reranked to {len(ranked)}")
     return [valid_chunks[idx] for idx, _, _ in ranked]
+
+async def _graph_temporal_hop(storage: Any, start_ids, max_neighbors_per_seed: int = 2) -> Set[str]:
+    if not start_ids:
+        return set()
+
+    out: Set[str] = set()
+    for nid in start_ids:
+        try:
+            edges = await storage.get_node_edges(nid)
+        except Exception:
+            edges = []
+
+        local = []
+        for s, t, d in edges:
+            other = t if s == nid else s
+            if not (isinstance(other, str) and other.startswith("mem-")):
+                continue
+            if isinstance(d, dict) and d.get("relation") == "temporal_next":
+                local.append(other)
+
+        local = sorted(set(local))
+        if max_neighbors_per_seed > 0:
+            local = local[:max_neighbors_per_seed]
+        out.update(local)
+
+    return out
+
 
 async def _graph_hop(storage: Any, start_ids, target_prefix) -> Set[str]:
     if not start_ids: return set()
